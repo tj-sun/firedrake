@@ -518,9 +518,11 @@ class PatchPC(PCBase):
             cells = cellIS.indices
             ncell = len(cells)
             dofs = cell_dofmap.ctypes.data
+            print("Cell dofmap is", cell_dofmap)
             cell_kernel.funptr(0, ncell, cells.ctypes.data, mat.handle,
                                dofs, dofs, *op_args)
             mat.assemble()
+            mat.view()
 
         has_int_facet_kernel = False
         if len(int_facet_kernels) > 0:
@@ -539,13 +541,19 @@ class PatchPC(PCBase):
                         facet_op_args.append(c_map._values.ctypes.data)
             facet_op_args.append(J.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
 
+            point2facetnumber = J.ufl_domain().interior_facets.point2facetnumber
+
             def facet_op(pc, point, vec, mat, facetIS, facet_dofmap, facet_dofmapWithAll):
-                facets = facetIS.indices
+                facets = numpy.asarray(list(map(point2facetnumber.__getitem__, facetIS.indices)),
+                                       dtype=IntType)
                 nfacet = len(facets)
                 dofs = facet_dofmap.ctypes.data
+                print("Facet dofmap is", facet_dofmap)
+                print("Facets are", facets)
                 int_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
                                         dofs, dofs, *facet_op_args)
                 mat.assemble()
+                mat.view()
 
         patch.setDM(mesh._plex)
         patch.setPatchCellNumbering(mesh._cell_numbering)
