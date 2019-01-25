@@ -499,6 +499,10 @@ class PatchPC(PCBase):
                    dofs, dofs, *op_args)
             mat.assemble()
 
+        def facet_op(pc, point, vec, mat, facetIS, facet_dofmap, facet_dofmapWithAll):
+            print("global facet numbers", facetIS.indices)
+            print("facet dofmap with bcs", facet_dofmap)
+            print("facet dofmap without bcs", facet_dofmapWithAll)
         patch.setDM(mesh._plex)
         patch.setPatchCellNumbering(mesh._cell_numbering)
 
@@ -512,6 +516,7 @@ class PatchPC(PCBase):
                                          ghost_bc_nodes,
                                          global_bc_nodes)
         patch.setPatchComputeOperator(op)
+        patch.setPatchComputeOperatorInteriorFacets(facet_op)
         patch.setPatchConstructType(patch.PatchConstructType.PYTHON,
                                     operator=self.user_construction_op)
         patch.setAttr("ctx", ctx)
