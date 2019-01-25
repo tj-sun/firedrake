@@ -4,6 +4,8 @@ from firedrake.solving_utils import _SNESContext
 from firedrake.matrix_free.operators import ImplicitMatrixContext
 from firedrake.dmhooks import get_appctx, push_appctx, pop_appctx
 
+from collections import namedtuple
+import operator
 from functools import partial
 import numpy
 import operator
@@ -185,6 +187,9 @@ class JITModule(seq.JITModule):
         return None
 
 
+CompiledKernel = namedtuple('CompiledKernel', ["funptr", "kinfo"])
+
+
 def matrix_funptr(form, state):
     from firedrake.tsfc_interface import compile_form
     test, trial = map(operator.methodcaller("function_space"), form.arguments())
@@ -196,57 +201,74 @@ def matrix_funptr(form, state):
     else:
         interface = None
 
-    kernel, = compile_form(form, "subspace_form", split=False, interface=interface)
+    kernels = compile_form(form, "subspace_form", split=False, interface=interface)
 
-    kinfo = kernel.kinfo
+    cell_kernels = []
+    int_facet_kernels = []
+    for kernel in kernels:
+        kinfo = kernel.kinfo
 
-    if kinfo.subdomain_id != "otherwise":
-        raise NotImplementedError("Only for full domain integrals")
-    if kinfo.integral_type != "cell":
-        raise NotImplementedError("Only for cell integrals")
+        if kinfo.subdomain_id != "otherwise":
+            raise NotImplementedError("Only for full domain integrals")
+        if kinfo.integral_type not in {"cell", "interior_facet"}:
+            raise NotImplementedError("Only for cell or interior facet integrals")
 
-    # OK, now we've validated the kernel, let's build the callback
-    args = []
+        # OK, now we've validated the kernel, let's build the callback
+        args = []
 
-    toset = op2.Set(1, comm=test.comm)
-    dofset = op2.DataSet(toset, 1)
-    arity = sum(m.arity*s.cdim
-                for m, s in zip(test.cell_node_map(),
-                                test.dof_dset))
-    iterset = test.cell_node_map().iterset
-    cell_node_map = op2.Map(iterset,
-                            toset, arity,
-                            values=numpy.zeros(iterset.total_size*arity, dtype=IntType))
-    mat = DenseMat(dofset)
+        if kinfo.integral_type == "cell":
+            get_map = operator.methodcaller("cell_node_map")
+            kernels = cell_kernels
+        elif kinfo.integral_type == "interior_facet":
+            get_map = operator.methodcaller("interior_facet_node_map")
+            kernels = int_facet_kernels
+        else:
+            get_map = None
 
-    arg = mat(op2.INC, (cell_node_map[op2.i[0]],
-                        cell_node_map[op2.i[1]]))
-    arg.position = 0
-    args.append(arg)
-    statedat = DenseDat(dofset)
-    statearg = statedat(op2.READ, cell_node_map[op2.i[0]])
+        toset = op2.Set(1, comm=test.comm)
+        dofset = op2.DataSet(toset, 1)
+        arity = sum(m.arity*s.cdim
+                    for m, s in zip(get_map(test),
+                                    test.dof_dset))
+        iterset = get_map(test).iterset
+        entity_node_map = op2.Map(iterset,
+                                  toset, arity,
+                                  values=numpy.zeros(iterset.total_size*arity, dtype=IntType))
+        mat = DenseMat(dofset)
 
-    mesh = form.ufl_domains()[kinfo.domain_number]
-    arg = mesh.coordinates.dat(op2.READ, mesh.coordinates.cell_node_map()[op2.i[0]])
-    arg.position = 1
-    args.append(arg)
-    for n in kinfo.coefficient_map:
-        c = form.coefficients()[n]
-        if c is state:
-            statearg.position = len(args)
-            args.append(statearg)
-            continue
-        for (i, c_) in enumerate(c.split()):
-            map_ = c_.cell_node_map()
-            if map_ is not None:
-                map_ = map_[op2.i[0]]
-            arg = c_.dat(op2.READ, map_)
+        arg = mat(op2.INC, (entity_node_map[op2.i[0]],
+                            entity_node_map[op2.i[1]]))
+        arg.position = 0
+        args.append(arg)
+        statedat = DenseDat(dofset)
+        statearg = statedat(op2.READ, entity_node_map[op2.i[0]])
+
+        mesh = form.ufl_domains()[kinfo.domain_number]
+        arg = mesh.coordinates.dat(op2.READ, get_map(mesh.coordinates)[op2.i[0]])
+        arg.position = 1
+        args.append(arg)
+        for n in kinfo.coefficient_map:
+            c = form.coefficients()[n]
+            if c is state:
+                statearg.position = len(args)
+                args.append(statearg)
+                continue
+            for (i, c_) in enumerate(c.split()):
+                map_ = get_map(c_)
+                if map_ is not None:
+                    map_ = map_[op2.i[0]]
+                arg = c_.dat(op2.READ, map_)
+                arg.position = len(args)
+                args.append(arg)
+
+        if kinfo.integral_type == "interior_facet":
+            arg = test.ufl_domain().interior_facets.local_facet_dat(op2.READ)
             arg.position = len(args)
             args.append(arg)
-
-    iterset = op2.Subset(mesh.cell_set, [0])
-    mod = JITModule(kinfo.kernel, iterset, *args)
-    return mod._fun, kinfo
+        iterset = op2.Subset(iterset, [0])
+        mod = JITModule(kinfo.kernel, iterset, *args)
+        kernels.append(CompiledKernel(mod._fun, kinfo))
+    return cell_kernels, int_facet_kernels
 
 
 def residual_funptr(form, state):
@@ -466,7 +488,7 @@ class PatchPC(PCBase):
         patch.setOptionsPrefix(pc.getOptionsPrefix() + "patch_")
         patch.setOperators(A, P)
         patch.setType("patch")
-        funptr, kinfo = matrix_funptr(J, None)
+        cell_kernels, int_facet_kernels = matrix_funptr(J, None)
         V, _ = map(operator.methodcaller("function_space"), J.arguments())
         mesh = V.ufl_domain()
 
@@ -479,8 +501,9 @@ class PatchPC(PCBase):
             ghost_bc_nodes = numpy.empty(0, dtype=PETSc.IntType)
             global_bc_nodes = numpy.empty(0, dtype=PETSc.IntType)
 
+        cell_kernel, = cell_kernels
         op_coeffs = [mesh.coordinates]
-        for n in kinfo.coefficient_map:
+        for n in cell_kernel.kinfo.coefficient_map:
             op_coeffs.append(J.coefficients()[n])
 
         op_args = []
@@ -495,14 +518,35 @@ class PatchPC(PCBase):
             cells = cellIS.indices
             ncell = len(cells)
             dofs = cell_dofmap.ctypes.data
-            funptr(0, ncell, cells.ctypes.data, mat.handle,
-                   dofs, dofs, *op_args)
+            cell_kernel.funptr(0, ncell, cells.ctypes.data, mat.handle,
+                               dofs, dofs, *op_args)
             mat.assemble()
 
-        def facet_op(pc, point, vec, mat, facetIS, facet_dofmap, facet_dofmapWithAll):
-            print("global facet numbers", facetIS.indices)
-            print("facet dofmap with bcs", facet_dofmap)
-            print("facet dofmap without bcs", facet_dofmapWithAll)
+        has_int_facet_kernel = False
+        if len(int_facet_kernels) > 0:
+            int_facet_kernel, = int_facet_kernels
+            has_int_facet_kernel = True
+            facet_op_coeffs = [mesh.coordinates]
+            for n in int_facet_kernel.kinfo.coefficient_map:
+                op_coeffs.append(J.coefficients()[n])
+
+            facet_op_args = []
+            for c in facet_op_coeffs:
+                for c_ in c.split():
+                    facet_op_args.append(c_.dat._data.ctypes.data)
+                    c_map = c_.interior_facet_node_map()
+                    if c_map is not None:
+                        facet_op_args.append(c_map._values.ctypes.data)
+            facet_op_args.append(J.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
+
+            def facet_op(pc, point, vec, mat, facetIS, facet_dofmap, facet_dofmapWithAll):
+                facets = facetIS.indices
+                nfacet = len(facets)
+                dofs = facet_dofmap.ctypes.data
+                int_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
+                                        dofs, dofs, *facet_op_args)
+                mat.assemble()
+
         patch.setDM(mesh._plex)
         patch.setPatchCellNumbering(mesh._cell_numbering)
 
@@ -516,7 +560,8 @@ class PatchPC(PCBase):
                                          ghost_bc_nodes,
                                          global_bc_nodes)
         patch.setPatchComputeOperator(op)
-        patch.setPatchComputeOperatorInteriorFacets(facet_op)
+        if has_int_facet_kernel:
+            patch.setPatchComputeOperatorInteriorFacets(facet_op)
         patch.setPatchConstructType(patch.PatchConstructType.PYTHON,
                                     operator=self.user_construction_op)
         patch.setAttr("ctx", ctx)
