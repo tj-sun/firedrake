@@ -295,41 +295,18 @@ class _SNESContext(object):
         with ctx._x.dat.vec_wo as v:
             X.copy(v)
 
-        if ctx._pre_jacobian_callback is not None:
-            ctx._pre_jacobian_callback(X)
-
-        ctx._assemble_jac()
-        ctx._jac.force_evaluation()
-        if ctx.Jp is not None:
-            assert P.handle == ctx._pjac.petscmat.handle
-            ctx._assemble_pjac()
-            ctx._pjac.force_evaluation()
-
-    @staticmethod
-    def compute_operators(ksp, J, P):
-        r"""Form the Jacobian for this problem
-
-        :arg ksp: a PETSc KSP object
-        :arg J: the Jacobian (a Mat)
-        :arg P: the preconditioner matrix (a Mat)
-        """
-        dm = ksp.getDM()
-        ctx = dmhooks.get_appctx(dm)
-        problem = ctx._problem
-
-        assert J.handle == ctx._jac.petscmat.handle
-        if problem._constant_jacobian and ctx._jacobian_assembled:
-            # Don't need to do any work with a constant jacobian
-            # that's already assembled
-            return
-        ctx._jacobian_assembled = True
-
+        # Temporary hack until we fix this in PETSc
+        # Inside fieldsplit inside SNES, right now the state we
+        # linearise around is always zero.
         fine = ctx._fine
         if fine is not None:
             _, _, inject = dmhooks.get_transfer_operators(fine._x.function_space().dm)
             inject(fine._x, ctx._x)
             for bc in ctx._problem.bcs:
                 bc.apply(ctx._x)
+
+        if ctx._pre_jacobian_callback is not None:
+            ctx._pre_jacobian_callback(X)
 
         ctx._assemble_jac()
         ctx._jac.force_evaluation()
