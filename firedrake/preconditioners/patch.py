@@ -1,4 +1,4 @@
-from firedrake.preconditioners.base import PCBase, SNESBase
+from firedrake.preconditioners.base import PCBase, SNESBase, PCSNESBase
 from firedrake.petsc import PETSc
 from firedrake.solving_utils import _SNESContext
 from firedrake.matrix_free.operators import ImplicitMatrixContext
@@ -9,8 +9,8 @@ import operator
 from functools import partial
 import numpy
 import operator
-from ufl import VectorElement, MixedElement, Coefficient, FunctionSpace
-from tsfc.kernel_interface.firedrake import KernelBuilder as FiredrakeKernelBuilder
+from ufl import VectorElement, MixedElement
+from tsfc.kernel_interface.firedrake import make_builder
 
 from pyop2 import op2
 from pyop2 import base as pyop2
@@ -18,60 +18,6 @@ from pyop2 import sequential as seq
 from pyop2.datatypes import IntType
 
 __all__ = ("PatchPC", "PlaneSmoother", "PatchSNES")
-
-
-class PatchKernelBuilder(FiredrakeKernelBuilder):
-    """Custom kernel interface for patch assembly.
-
-    Ensures that a provided set of coefficients are not split apart if they are mixed.
-
-    This is necessary because PETSc provides the state vector (which
-    may be mixed) as one concatenated vector, rather than the
-    Firedrake convention of one vector per subspace."""
-    def __init__(self, *unsplit_coefficients):
-        self.unsplit_coefficients = frozenset(unsplit_coefficients)
-        self.KernelBuilder = self
-
-    # TSFC makes the kernel builder by calling "interface.KernelBuilder(...)"
-    # on the provided interface object. So mock that with this __call__ method.
-    def __call__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        return self
-
-    def set_coefficients(self, integral_data, form_data):
-        """Prepare the coefficients of the form.
-
-        :arg integral_data: UFL integral data
-        :arg form_data: UFL form data
-        """
-        coefficients = []
-        coefficient_numbers = []
-        # enabled_coefficients is a boolean array that indicates which
-        # of reduced_coefficients the integral requires.
-        for i in range(len(integral_data.enabled_coefficients)):
-            if integral_data.enabled_coefficients[i]:
-                orig = form_data.reduced_coefficients[i]
-                coefficient = form_data.function_replace_map[orig]
-                if type(coefficient.ufl_element()) == MixedElement:
-                    if orig in self.unsplit_coefficients:
-                        coefficients.append(coefficient)
-                        self.coefficient_split[coefficient] = [coefficient]
-                    else:
-                        split = [Coefficient(FunctionSpace(coefficient.ufl_domain(), element))
-                                 for element in coefficient.ufl_element().sub_elements()]
-                        coefficients.extend(split)
-                        self.coefficient_split[coefficient] = split
-                else:
-                    coefficients.append(coefficient)
-                # This is which coefficient in the original form the
-                # current coefficient is.
-                # Consider f*v*dx + g*v*ds, the full form contains two
-                # coefficients, but each integral only requires one.
-                coefficient_numbers.append(form_data.original_coefficient_positions[i])
-        for i, coefficient in enumerate(coefficients):
-            self.coefficient_args.append(
-                self._coefficient(coefficient, "w_%d" % i))
-        self.kernel.coefficient_numbers = tuple(coefficient_numbers)
 
 
 class DenseSparsity(object):
@@ -197,7 +143,7 @@ def matrix_funptr(form, state):
         raise NotImplementedError("Only for matching test and trial spaces")
 
     if state is not None:
-        interface = PatchKernelBuilder(state)
+        interface = make_builder(dont_split=(state, ))
     else:
         interface = None
 
@@ -279,7 +225,7 @@ def residual_funptr(form, state):
         raise NotImplementedError("State and test space must be dual to one-another")
 
     if state is not None:
-        interface = PatchKernelBuilder(state)
+        interface = make_builder(dont_split=(state, ))
     else:
         interface = None
 
@@ -466,168 +412,25 @@ class PlaneSmoother(object):
         return (patches, iterationSet)
 
 
-class PatchPC(PCBase):
-    def initialize(self, pc):
-        A, P = pc.getOperators()
+class PatchBase(PCSNESBase):
 
-        ctx = get_appctx(pc.getDM())
+    needs_python_pmat = False
+
+    def initialize(self, obj):
+
+        if isinstance(obj, PETSc.PC):
+            A, P = obj.getOperators()
+        elif isinstance(obj, PETSc.SNES):
+            A, P = obj.ksp.pc.getOperators()
+        else:
+            raise ValueError("Not a PC or SNES?")
+
+        ctx = get_appctx(obj.getDM())
         if ctx is None:
             raise ValueError("No context found on form")
         if not isinstance(ctx, _SNESContext):
             raise ValueError("Don't know how to get form from %r", ctx)
 
-        if P.getType() == "python":
-            ictx = P.getPythonContext()
-            if ictx is None:
-                raise ValueError("No context found on matrix")
-            if not isinstance(ictx, ImplicitMatrixContext):
-                raise ValueError("Don't know how to get form from %r", ctx)
-            J = ictx.a
-            bcs = ictx.row_bcs
-            if bcs != ictx.col_bcs:
-                raise NotImplementedError("Row and column bcs must match")
-        else:
-            J = ctx.Jp or ctx.J
-            bcs = ctx._problem.bcs
-
-        mesh = J.ufl_domain()
-        if mesh.cell_set._extruded:
-            raise NotImplementedError("Not implemented on extruded meshes")
-
-        if "overlap_type" not in mesh._distribution_parameters:
-            if mesh.mpi_comm().size > 1:
-                # Want to do
-                # warnings.warn("You almost surely want to set an overlap_type in your mesh's distribution_parameters.")
-                # but doesn't warn!
-                PETSc.Sys.Print("Warning: you almost surely want to set an overlap_type in your mesh's distribution_parameters.")
-
-        patch = PETSc.PC().create(comm=pc.comm)
-        patch.setOptionsPrefix(pc.getOptionsPrefix() + "patch_")
-        patch.setOperators(A, P)
-        patch.setType("patch")
-        cell_kernels, int_facet_kernels = matrix_funptr(J, None)
-        V, _ = map(operator.methodcaller("function_space"), J.arguments())
-        mesh = V.ufl_domain()
-
-        if len(bcs) > 0:
-            ghost_bc_nodes = numpy.unique(numpy.concatenate([bcdofs(bc, ghost=True)
-                                                             for bc in bcs]))
-            global_bc_nodes = numpy.unique(numpy.concatenate([bcdofs(bc, ghost=False)
-                                                              for bc in bcs]))
-        else:
-            ghost_bc_nodes = numpy.empty(0, dtype=PETSc.IntType)
-            global_bc_nodes = numpy.empty(0, dtype=PETSc.IntType)
-
-        cell_kernel, = cell_kernels
-        op_coeffs = [mesh.coordinates]
-        for n in cell_kernel.kinfo.coefficient_map:
-            op_coeffs.append(J.coefficients()[n])
-
-        op_args = []
-        for c in op_coeffs:
-            for c_ in c.split():
-                op_args.append(c_.dat._data.ctypes.data)
-                c_map = c_.cell_node_map()
-                if c_map is not None:
-                    op_args.append(c_map._values.ctypes.data)
-
-        def op(pc, point, vec, mat, cellIS, cell_dofmap, cell_dofmapWithAll):
-            cells = cellIS.indices
-            ncell = len(cells)
-            dofs = cell_dofmap.ctypes.data
-            cell_kernel.funptr(0, ncell, cells.ctypes.data, mat.handle,
-                               dofs, dofs, *op_args)
-
-        has_int_facet_kernel = False
-        if len(int_facet_kernels) > 0:
-            int_facet_kernel, = int_facet_kernels
-            has_int_facet_kernel = True
-            facet_op_coeffs = [mesh.coordinates]
-            for n in int_facet_kernel.kinfo.coefficient_map:
-                facet_op_coeffs.append(J.coefficients()[n])
-
-            facet_op_args = []
-            for c in facet_op_coeffs:
-                for c_ in c.split():
-                    facet_op_args.append(c_.dat._data.ctypes.data)
-                    c_map = c_.interior_facet_node_map()
-                    if c_map is not None:
-                        facet_op_args.append(c_map._values.ctypes.data)
-            facet_op_args.append(J.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
-
-            point2facetnumber = J.ufl_domain().interior_facets.point2facetnumber
-
-            def facet_op(pc, point, vec, mat, facetIS, facet_dofmap, facet_dofmapWithAll):
-                facets = numpy.asarray(list(map(point2facetnumber.__getitem__, facetIS.indices)),
-                                       dtype=IntType)
-                nfacet = len(facets)
-                dofs = facet_dofmap.ctypes.data
-                int_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
-                                        dofs, dofs, *facet_op_args)
-
-        patch.setDM(mesh._plex)
-        patch.setPatchCellNumbering(mesh._cell_numbering)
-
-        offsets = numpy.append([0], numpy.cumsum([W.dof_count
-                                                  for W in V])).astype(PETSc.IntType)
-        patch.setPatchDiscretisationInfo([W.dm for W in V],
-                                         numpy.array([W.value_size for
-                                                      W in V], dtype=PETSc.IntType),
-                                         [W.cell_node_list for W in V],
-                                         offsets,
-                                         ghost_bc_nodes,
-                                         global_bc_nodes)
-        patch.setPatchComputeOperator(op)
-        if has_int_facet_kernel:
-            patch.setPatchComputeOperatorInteriorFacets(facet_op)
-        patch.setPatchConstructType(patch.PatchConstructType.PYTHON,
-                                    operator=self.user_construction_op)
-        patch.setAttr("ctx", ctx)
-        patch.incrementTabLevel(1, parent=pc)
-        patch.setFromOptions()
-        patch.setUp()
-        self.patch = patch
-
-    @staticmethod
-    def user_construction_op(pc, *args, **kwargs):
-        prefix = pc.getOptionsPrefix()
-        sentinel = object()
-        usercode = PETSc.Options(prefix).getString("pc_patch_construct_python_type", default=sentinel)
-        if usercode == sentinel:
-            raise ValueError("Must set %spc_patch_construct_python_type" % prefix)
-
-        (modname, funname) = usercode.rsplit('.', 1)
-        mod = __import__(modname)
-        fun = getattr(mod, funname)
-        if isinstance(fun, type):
-            fun = fun()
-        return fun(pc, *args, **kwargs)
-
-    def update(self, pc):
-        self.patch.setUp()
-
-    def apply(self, pc, x, y):
-        self.patch.apply(x, y)
-
-    def applyTranspose(self, pc, x, y):
-        self.patch.applyTranspose(x, y)
-
-    def view(self, pc, viewer=None):
-        self.patch.view(viewer=viewer)
-
-
-class PatchSNES(SNESBase):
-    def initialize(self, snes):
-        ctx = get_appctx(snes.getDM())
-        if ctx is None:
-            raise ValueError("No context found on form")
-        if not isinstance(ctx, _SNESContext):
-            raise ValueError("Don't know how to get form from %r", ctx)
-        F = ctx.F
-        state = ctx._problem.u
-
-        pc = snes.ksp.pc
-        A, P = pc.getOperators()
         if P.getType() == "python":
             ictx = P.getPythonContext()
             if ictx is None:
@@ -645,22 +448,28 @@ class PatchSNES(SNESBase):
         mesh = J.ufl_domain()
         self.plex = mesh._plex
         self.ctx = ctx
+
         if mesh.cell_set._extruded:
             raise NotImplementedError("Not implemented on extruded meshes")
 
         if "overlap_type" not in mesh._distribution_parameters:
-            if mesh.mpi_comm().size > 1:
+            if mesh.comm.size > 1:
                 # Want to do
                 # warnings.warn("You almost surely want to set an overlap_type in your mesh's distribution_parameters.")
                 # but doesn't warn!
                 PETSc.Sys.Print("Warning: you almost surely want to set an overlap_type in your mesh's distribution_parameters.")
 
-        patch = PETSc.SNES().create(comm=snes.comm)
-        patch.setOptionsPrefix(snes.getOptionsPrefix() + "patch_")
+        patch = obj.__class__().create(comm=obj.comm)
+        patch.setOptionsPrefix(obj.getOptionsPrefix() + "patch_")
+        self.configure_patch(patch, obj)
         patch.setType("patch")
 
+        if isinstance(obj, PETSc.SNES):
+            Jstate = ctx._problem.u
+        else:
+            Jstate = None
+
         V, _ = map(operator.methodcaller("function_space"), J.arguments())
-        mesh = V.ufl_domain()
 
         if len(bcs) > 0:
             ghost_bc_nodes = numpy.unique(numpy.concatenate([bcdofs(bc, ghost=True)
@@ -680,7 +489,7 @@ class PatchSNES(SNESBase):
         Jop_args = []
         Jop_state_slot = None
         for c in Jop_coeffs:
-            if c is state:
+            if c is Jstate:
                 Jop_state_slot = len(Jop_args)
                 Jop_args.append(None)
                 Jop_args.append(None)
@@ -691,7 +500,7 @@ class PatchSNES(SNESBase):
                 if c_map is not None:
                     Jop_args.append(c_map._values.ctypes.data)
 
-        def Jop(pc, point, vec, mat, cellIS, cell_dofmap, cell_dofmapWithAll):
+        def Jop(obj, point, vec, mat, cellIS, cell_dofmap, cell_dofmapWithAll):
             cells = cellIS.indices
             ncell = len(cells)
             dofs = cell_dofmap.ctypes.data
@@ -705,7 +514,7 @@ class PatchSNES(SNESBase):
                 Jop_args[Jop_state_slot] = vec.array_r.ctypes.data
                 Jop_args[Jop_state_slot + 1] = dofsWithAll
             Jcell_kernel.funptr(0, ncell, cells.ctypes.data, mat.handle,
-                    dofs, dofs, *Jop_args)
+                                dofs, dofs, *Jop_args)
 
         Jhas_int_facet_kernel = False
         if len(Jint_facet_kernels) > 0:
@@ -732,72 +541,74 @@ class PatchSNES(SNESBase):
                 nfacet = len(facets)
                 dofs = facet_dofmap.ctypes.data
                 Jint_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
-                                        dofs, dofs, *facet_op_args)
+                                         dofs, dofs, *facet_op_args)
 
-        Fcell_kernels, Fint_facet_kernels = residual_funptr(F, state)
-        Fop_coeffs = [mesh.coordinates]
-        Fcell_kernel, = Fcell_kernels
-        for n in Fcell_kernel.kinfo.coefficient_map:
-            Fop_coeffs.append(F.coefficients()[n])
-        assert any(c is state for c in Fop_coeffs), "Couldn't find state vector in F.coefficients()"
+        if hasattr(ctx, "F"):
+            F = ctx.F
+            Fstate = ctx._problem.u
+            Fcell_kernels, Fint_facet_kernels = residual_funptr(F, state)
+            Fop_coeffs = [mesh.coordinates]
+            Fcell_kernel, = Fcell_kernels
+            for n in Fcell_kernel.kinfo.coefficient_map:
+                Fop_coeffs.append(F.coefficients()[n])
+            assert any(c is Fstate for c in Fop_coeffs), "Couldn't find state vector in F.coefficients()"
 
-        Fop_args = []
-        Fop_state_slot = None
-        for c in Fop_coeffs:
-            if c is state:
-                Fop_state_slot = len(Fop_args)
-                Fop_args.append(None)
-                Fop_args.append(None)
-                continue
-            for c_ in c.split():
-                Fop_args.append(c_.dat._data.ctypes.data)
-                c_map = c_.cell_node_map()
-                if c_map is not None:
-                    Fop_args.append(c_map._values.ctypes.data)
-
-        assert Fop_state_slot is not None
-
-        def Fop(pc, point, vec, out, cellIS, cell_dofmap, cell_dofmapWithAll):
-            cells = cellIS.indices
-            ncell = len(cells)
-            dofs = cell_dofmap.ctypes.data
-            dofsWithAll = cell_dofmapWithAll.ctypes.data
-            out.set(0)
-            outdata = out.array
-            Fop_args[Fop_state_slot] = vec.array_r.ctypes.data
-            Fop_args[Fop_state_slot + 1] = dofsWithAll
-            Fcell_kernel.funptr(0, ncell, cells.ctypes.data, outdata.ctypes.data,
-                    dofs, *Fop_args)
-            # FIXME: Do we need this, I think not.
-
-        Fhas_int_facet_kernel = False
-        if len(Fint_facet_kernels) > 0:
-            Fint_facet_kernel, = Fint_facet_kernels
-            Fhas_int_facet_kernel = True
-            facet_op_coeffs = [mesh.coordinates]
-            for n in Fint_facet_kernel.kinfo.coefficient_map:
-                facet_op_coeffs.append(J.coefficients()[n])
-
-            facet_op_args = []
-            for c in facet_op_coeffs:
+            Fop_args = []
+            Fop_state_slot = None
+            for c in Fop_coeffs:
+                if c is Fstate:
+                    Fop_state_slot = len(Fop_args)
+                    Fop_args.append(None)
+                    Fop_args.append(None)
+                    continue
                 for c_ in c.split():
-                    facet_op_args.append(c_.dat._data.ctypes.data)
-                    c_map = c_.interior_facet_node_map()
+                    Fop_args.append(c_.dat._data.ctypes.data)
+                    c_map = c_.cell_node_map()
                     if c_map is not None:
-                        facet_op_args.append(c_map._values.ctypes.data)
-            facet_op_args.append(F.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
+                        Fop_args.append(c_map._values.ctypes.data)
 
-            point2facetnumber = F.ufl_domain().interior_facets.point2facetnumber
+            assert Fop_state_slot is not None
 
-            def Ffacet_op(pc, point, vec, mat, facetIS, facet_dofmap, facet_dofmapWithAll):
-                facets = numpy.asarray(list(map(point2facetnumber.__getitem__, facetIS.indices)),
-                                       dtype=IntType)
-                nfacet = len(facets)
-                dofs = facet_dofmap.ctypes.data
-                Fint_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
-                                        dofs, dofs, *facet_op_args)
+            def Fop(pc, point, vec, out, cellIS, cell_dofmap, cell_dofmapWithAll):
+                cells = cellIS.indices
+                ncell = len(cells)
+                dofs = cell_dofmap.ctypes.data
+                dofsWithAll = cell_dofmapWithAll.ctypes.data
+                out.set(0)
+                outdata = out.array
+                Fop_args[Fop_state_slot] = vec.array_r.ctypes.data
+                Fop_args[Fop_state_slot + 1] = dofsWithAll
+                Fcell_kernel.funptr(0, ncell, cells.ctypes.data, outdata.ctypes.data,
+                                    dofs, *Fop_args)
 
-        patch.setDM(mesh._plex)
+            Fhas_int_facet_kernel = False
+            if len(Fint_facet_kernels) > 0:
+                Fint_facet_kernel, = Fint_facet_kernels
+                Fhas_int_facet_kernel = True
+                facet_op_coeffs = [mesh.coordinates]
+                for n in Fint_facet_kernel.kinfo.coefficient_map:
+                    facet_op_coeffs.append(J.coefficients()[n])
+
+                facet_op_args = []
+                for c in facet_op_coeffs:
+                    for c_ in c.split():
+                        facet_op_args.append(c_.dat._data.ctypes.data)
+                        c_map = c_.interior_facet_node_map()
+                        if c_map is not None:
+                            facet_op_args.append(c_map._values.ctypes.data)
+                facet_op_args.append(F.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
+
+                point2facetnumber = F.ufl_domain().interior_facets.point2facetnumber
+
+                def Ffacet_op(pc, point, vec, mat, facetIS, facet_dofmap, facet_dofmapWithAll):
+                    facets = numpy.asarray(list(map(point2facetnumber.__getitem__, facetIS.indices)),
+                                           dtype=IntType)
+                    nfacet = len(facets)
+                    dofs = facet_dofmap.ctypes.data
+                    Fint_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
+                                             dofs, dofs, *facet_op_args)
+
+        patch.setDM(self.plex)
         patch.setPatchCellNumbering(mesh._cell_numbering)
 
         offsets = numpy.append([0], numpy.cumsum([W.dof_count
@@ -815,43 +626,60 @@ class PatchSNES(SNESBase):
         patch.setPatchComputeFunction(Fop)
         if Fhas_int_facet_kernel:
             patch.setPatchComputeFunctionInteriorFacets(Ffacet_op)
-        patch.setPatchConstructType(PETSc.PC.PatchConstructType.PYTHON,
-                                    operator=self.user_construction_op)
-
-        (f, residual) = snes.getFunction()
-        assert residual is not None
-        (fun, args, kargs) = residual
-        patch.setFunction(fun, f.duplicate(), args=args, kargs=kargs)
-
+        patch.setPatchConstructType(PETSc.PC.PatchConstructType.PYTHON, operator=self.user_construction_op)
         patch.setAttr("ctx", ctx)
-        patch.incrementTabLevel(1, parent=snes)
-        patch.setTolerances(max_it=1)
-        patch.setConvergenceTest("skip")
+        patch.incrementTabLevel(1, parent=obj)
         patch.setFromOptions()
         patch.setUp()
         self.patch = patch
 
-        # Need an empty RHS for the solve,
-        # PCApply can't deal with RHS = NULL
-        self.dummy = f.duplicate()
-
-    @staticmethod
-    def user_construction_op(pc, *args, **kwargs):
-        prefix = pc.getOptionsPrefix()
+    def user_construction_op(self, obj, *args, **kwargs):
+        prefix = obj.getOptionsPrefix()
         sentinel = object()
-        usercode = PETSc.Options(prefix).getString("snes_patch_construct_python_type", default=sentinel)
+        usercode = PETSc.Options(prefix).getString("%s_patch_construct_python_type" % self._objectname, default=sentinel)
         if usercode == sentinel:
-            raise ValueError("Must set %ssnes_patch_construct_python_type" % prefix)
+            raise ValueError("Must set %s%s_patch_construct_python_type" % (prefix, self._objectname))
 
         (modname, funname) = usercode.rsplit('.', 1)
         mod = __import__(modname)
         fun = getattr(mod, funname)
         if isinstance(fun, type):
             fun = fun()
-        return fun(pc, *args, **kwargs)
+        return fun(obj, *args, **kwargs)
 
     def update(self, pc):
         self.patch.setUp()
+
+    def view(self, pc, viewer=None):
+        self.patch.view(viewer=viewer)
+
+
+class PatchPC(PCBase, PatchBase):
+    def configure_patch(self, patch, pc):
+        (A, P) = pc.getOperators()
+        patch.setOperators(A, P)
+
+    def apply(self, pc, x, y):
+        self.patch.apply(x, y)
+
+    def applyTranspose(self, pc, x, y):
+        self.patch.applyTranspose(x, y)
+
+
+class PatchSNES(SNESBase, PatchBase):
+    def configure_patch(self, patch, snes):
+        patch.setTolerances(max_it=1)
+        patch.setConvergenceTest("skip")
+
+        (f, residual) = snes.getFunction()
+        assert residual is not None
+        (fun, args, kargs) = residual
+        patch.setFunction(fun, f.duplicate(), args=args, kargs=kargs)
+
+        # Need an empty RHS for the solve,
+        # PCApply can't deal with RHS = NULL,
+        # and this goes through a call to PCApply at some point
+        self.dummy = f.duplicate()
 
     def step(self, snes, x, f, y):
         push_appctx(self.plex, self.ctx)
@@ -861,6 +689,3 @@ class PatchSNES(SNESBase):
         y.scale(-1)
         snes.setConvergedReason(self.patch.getConvergedReason())
         pop_appctx(self.plex)
-
-    def view(self, pc, viewer=None):
-        self.patch.view(viewer=viewer)

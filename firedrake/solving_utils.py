@@ -233,7 +233,7 @@ class _SNESContext(object):
                                         bc.function_arg,
                                         bc.sub_domain,
                                         method=bc.method))
-            new_problem = NLVP(F, subu, bcs=bcs, J=J, Jp=None,
+            new_problem = NLVP(F, subu, bcs=bcs, J=J, Jp=Jp,
                                form_compiler_parameters=problem.form_compiler_parameters)
             new_problem._constant_jacobian = problem._constant_jacobian
             splits.append(type(self)(new_problem, mat_type=self.mat_type, pmat_type=self.pmat_type,
@@ -295,9 +295,41 @@ class _SNESContext(object):
         with ctx._x.dat.vec_wo as v:
             X.copy(v)
 
-        # Temporary hack until we fix this in PETSc
-        # Inside fieldsplit inside SNES, right now the state we
-        # linearise around is always zero.
+        if ctx._pre_jacobian_callback is not None:
+            ctx._pre_jacobian_callback(X)
+
+        ctx._assemble_jac()
+        ctx._jac.force_evaluation()
+
+        if ctx.Jp is not None:
+            assert P.handle == ctx._pjac.petscmat.handle
+            ctx._assemble_pjac()
+            ctx._pjac.force_evaluation()
+
+        ises = problem.J.arguments()[0].function_space()._ises
+        ctx.set_nullspace(ctx._nullspace, ises, transpose=False, near=False)
+        ctx.set_nullspace(ctx._nullspace_T, ises, transpose=True, near=False)
+        ctx.set_nullspace(ctx._near_nullspace, ises, transpose=False, near=True)
+
+    @staticmethod
+    def compute_operators(ksp, J, P):
+        r"""Form the Jacobian for this problem
+
+        :arg ksp: a PETSc KSP object
+        :arg J: the Jacobian (a Mat)
+        :arg P: the preconditioner matrix (a Mat)
+        """
+        dm = ksp.getDM()
+        ctx = dmhooks.get_appctx(dm)
+        problem = ctx._problem
+
+        assert J.handle == ctx._jac.petscmat.handle
+        if problem._constant_jacobian and ctx._jacobian_assembled:
+            # Don't need to do any work with a constant jacobian
+            # that's already assembled
+            return
+        ctx._jacobian_assembled = True
+
         fine = ctx._fine
         if fine is not None:
             _, _, inject = dmhooks.get_transfer_operators(fine._x.function_space().dm)

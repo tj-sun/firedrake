@@ -107,12 +107,13 @@ class NonlinearVariationalSolver(OptionsManager):
 
             {'snes_type': 'ksponly'}
 
-        PETSc flag options should be specified with `bool` values.
+        PETSc flag options (where the presence of the option means something) should
+        be specified with ``None``.
         For example:
 
         .. code-block:: python
 
-            {'snes_monitor': True}
+            {'snes_monitor': None}
 
         To use the ``pre_jacobian_callback`` or ``pre_function_callback``
         functionality, the user-defined function must accept the current
@@ -270,7 +271,7 @@ class LinearVariationalProblem(NonlinearVariationalProblem):
         # In the linear case, the Jacobian is the equation LHS.
         J = a
         # Jacobian is checked in superclass, but let's check L here.
-        if L is 0:
+        if L is 0:  # noqa: F632
             F = ufl_expr.action(J, u)
         else:
             if not isinstance(L, (ufl.Form, slate.slate.TensorBase)):
