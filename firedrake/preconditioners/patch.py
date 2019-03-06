@@ -480,7 +480,7 @@ class PatchBase(PCSNESBase):
             ghost_bc_nodes = numpy.empty(0, dtype=PETSc.IntType)
             global_bc_nodes = numpy.empty(0, dtype=PETSc.IntType)
 
-        Jcell_kernels, Jint_facet_kernels = matrix_funptr(J, state)
+        Jcell_kernels, Jint_facet_kernels = matrix_funptr(J, Jstate)
         Jop_coeffs = [mesh.coordinates]
         Jcell_kernel, = Jcell_kernels
         for n in Jcell_kernel.kinfo.coefficient_map:
@@ -508,7 +508,6 @@ class PatchBase(PCSNESBase):
                 dofsWithAll = cell_dofmapWithAll.ctypes.data
             else:
                 dofsWithAll = None
-            mat.zeroEntries()
             if Jop_state_slot is not None:
                 assert dofsWithAll is not None
                 Jop_args[Jop_state_slot] = vec.array_r.ctypes.data
@@ -546,7 +545,7 @@ class PatchBase(PCSNESBase):
         if hasattr(ctx, "F"):
             F = ctx.F
             Fstate = ctx._problem.u
-            Fcell_kernels, Fint_facet_kernels = residual_funptr(F, state)
+            Fcell_kernels, Fint_facet_kernels = residual_funptr(F, Fstate)
             Fop_coeffs = [mesh.coordinates]
             Fcell_kernel, = Fcell_kernels
             for n in Fcell_kernel.kinfo.coefficient_map:
