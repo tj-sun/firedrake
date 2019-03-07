@@ -519,18 +519,18 @@ class PatchBase(PCSNESBase):
         if len(Jint_facet_kernels) > 0:
             Jint_facet_kernel, = Jint_facet_kernels
             Jhas_int_facet_kernel = True
-            facet_op_coeffs = [mesh.coordinates]
+            facet_Jop_coeffs = [mesh.coordinates]
             for n in Jint_facet_kernel.kinfo.coefficient_map:
-                facet_op_coeffs.append(J.coefficients()[n])
+                facet_Jop_coeffs.append(J.coefficients()[n])
 
-            facet_op_args = []
-            for c in facet_op_coeffs:
+            facet_Jop_args = []
+            for c in facet_Jop_coeffs:
                 for c_ in c.split():
-                    facet_op_args.append(c_.dat._data.ctypes.data)
+                    facet_Jop_args.append(c_.dat._data.ctypes.data)
                     c_map = c_.interior_facet_node_map()
                     if c_map is not None:
-                        facet_op_args.append(c_map._values.ctypes.data)
-            facet_op_args.append(J.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
+                        facet_Jop_args.append(c_map._values.ctypes.data)
+            facet_Jop_args.append(J.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
 
             point2facetnumber = J.ufl_domain().interior_facets.point2facetnumber
 
@@ -540,7 +540,7 @@ class PatchBase(PCSNESBase):
                 nfacet = len(facets)
                 dofs = facet_dofmap.ctypes.data
                 Jint_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
-                                         dofs, dofs, *facet_op_args)
+                                         dofs, dofs, *facet_Jop_args)
 
         if hasattr(ctx, "F"):
             F = ctx.F
@@ -584,18 +584,18 @@ class PatchBase(PCSNESBase):
             if len(Fint_facet_kernels) > 0:
                 Fint_facet_kernel, = Fint_facet_kernels
                 Fhas_int_facet_kernel = True
-                facet_op_coeffs = [mesh.coordinates]
+                facet_Fop_coeffs = [mesh.coordinates]
                 for n in Fint_facet_kernel.kinfo.coefficient_map:
-                    facet_op_coeffs.append(J.coefficients()[n])
+                    facet_Fop_coeffs.append(J.coefficients()[n])
 
-                facet_op_args = []
-                for c in facet_op_coeffs:
+                facet_Fop_args = []
+                for c in facet_Fop_coeffs:
                     for c_ in c.split():
-                        facet_op_args.append(c_.dat._data.ctypes.data)
+                        facet_Fop_args.append(c_.dat._data.ctypes.data)
                         c_map = c_.interior_facet_node_map()
                         if c_map is not None:
-                            facet_op_args.append(c_map._values.ctypes.data)
-                facet_op_args.append(F.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
+                            facet_Fop_args.append(c_map._values.ctypes.data)
+                facet_Fop_args.append(F.ufl_domain().interior_facets.local_facet_dat._data.ctypes.data)
 
                 point2facetnumber = F.ufl_domain().interior_facets.point2facetnumber
 
@@ -605,7 +605,7 @@ class PatchBase(PCSNESBase):
                     nfacet = len(facets)
                     dofs = facet_dofmap.ctypes.data
                     Fint_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
-                                             dofs, dofs, *facet_op_args)
+                                             dofs, dofs, *facet_Fop_args)
 
         patch.setDM(self.plex)
         patch.setPatchCellNumbering(mesh._cell_numbering)
