@@ -8,7 +8,6 @@ from collections import namedtuple
 import operator
 from functools import partial
 import numpy
-import operator
 from ufl import VectorElement, MixedElement
 from tsfc.kernel_interface.firedrake import make_builder
 
@@ -258,8 +257,8 @@ def residual_funptr(form, state):
                                     test.dof_dset))
         iterset = get_map(test).iterset
         entity_node_map = op2.Map(iterset,
-                                toset, arity,
-                                values=numpy.zeros(iterset.total_size*arity, dtype=IntType))
+                                  toset, arity,
+                                  values=numpy.zeros(iterset.total_size*arity, dtype=IntType))
         dat = DenseDat(dofset)
 
         statedat = DenseDat(dofset)

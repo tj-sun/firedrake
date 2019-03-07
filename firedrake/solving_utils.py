@@ -337,9 +337,6 @@ class _SNESContext(object):
             for bc in ctx._problem.bcs:
                 bc.apply(ctx._x)
 
-        if ctx._pre_jacobian_callback is not None:
-            ctx._pre_jacobian_callback(X)
-
         ctx._assemble_jac()
         ctx._jac.force_evaluation()
         if ctx.Jp is not None:
