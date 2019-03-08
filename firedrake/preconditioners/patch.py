@@ -541,7 +541,8 @@ class PatchBase(PCSNESBase):
                 Jint_facet_kernel.funptr(0, nfacet, facets.ctypes.data, mat.handle,
                                          dofs, dofs, *facet_Jop_args)
 
-        if hasattr(ctx, "F"):
+        set_residual = hasattr(ctx, "F") and isinstance(obj, PETSc.SNES)
+        if set_residual:
             F = ctx.F
             Fstate = ctx._problem.u
             Fcell_kernels, Fint_facet_kernels = residual_funptr(F, Fstate)
@@ -621,9 +622,11 @@ class PatchBase(PCSNESBase):
         patch.setPatchComputeOperator(Jop)
         if Jhas_int_facet_kernel:
             patch.setPatchComputeOperatorInteriorFacets(Jfacet_op)
-        patch.setPatchComputeFunction(Fop)
-        if Fhas_int_facet_kernel:
-            patch.setPatchComputeFunctionInteriorFacets(Ffacet_op)
+        if set_residual:
+            patch.setPatchComputeFunction(Fop)
+            if Fhas_int_facet_kernel:
+                patch.setPatchComputeFunctionInteriorFacets(Ffacet_op)
+
         patch.setPatchConstructType(PETSc.PC.PatchConstructType.PYTHON, operator=self.user_construction_op)
         patch.setAttr("ctx", ctx)
         patch.incrementTabLevel(1, parent=obj)
